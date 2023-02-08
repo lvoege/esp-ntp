@@ -39,15 +39,14 @@ const char LOG_TAG[] = "esp-ntp";
 
 static SemaphoreHandle_t pps_mutex;
 static uint32_t gps_time_in_seconds = 0;
-static bool pps_flag;
 static uint64_t us_since_boot_of_last_pps;
 
 static void pps_handler(void *) {
     xSemaphoreTakeFromISR(pps_mutex, nullptr);
-    pps_flag = true;
     ++gps_time_in_seconds;
     us_since_boot_of_last_pps = esp_timer_get_time();
     xSemaphoreGiveFromISR(pps_mutex, nullptr);
+    ets_printf("PPS %lu\n", gps_time_in_seconds);
 }
 
 static void setup_pps() {
@@ -97,7 +96,7 @@ static void setup_gps() {
         for (auto line: std::string_view(buf, buf + num_read)
                 | std::ranges::views::split('\n')
                 | std::ranges::views::transform([](auto&& str) { return std::string_view(&*str.begin(), std::ranges::distance(str)); })) {
-            printf("LINE %s\n", line.data());
+            esp_log_write(ESP_LOG_DEBUG, LOG_TAG, "%s\n", line.data());
 
             if (line.starts_with("$GPRMC")) {
                 struct tm tm;
@@ -140,7 +139,10 @@ static void setup_gps() {
 
                 if (okay) {
                     auto unix_timestamp = mktime(&tm);
-                    gps_time_in_seconds = (uint32_t)unix_timestamp + 25567U * 24 * 3600; // there were, according to some googling, 22567 days between 1/1/1900 and 1/1/1970.
+                    if (xSemaphoreTake(pps_mutex, 10) == pdTRUE) {
+                        gps_time_in_seconds = (uint32_t)unix_timestamp + 25567U * 24 * 3600; // there were, according to some googling, 22567 days between 1/1/1900 and 1/1/1970.
+                        xSemaphoreGive(pps_mutex);
+                    }
                     esp_log_write(ESP_LOG_DEBUG, LOG_TAG, "Got GPS timestamp of %lu", gps_time_in_seconds);
 
                     ESP_ERROR_CHECK(uart_driver_delete(UART_NUM_1));
@@ -248,10 +250,9 @@ static ntp_timestamp time_at_boot;
 static void stamp(ntp_timestamp *ts) {
     if (xSemaphoreTake(pps_mutex, 10) == pdTRUE) {
         ts->seconds = gps_time_in_seconds;
-        timeval now;
-        gettimeofday(&now, nullptr);
-
-        auto usec = esp_timer_get_time() - us_since_boot_of_last_pps;
+        auto usec = us_since_boot_of_last_pps;
+        xSemaphoreGive(pps_mutex);
+        usec = esp_timer_get_time() - usec;
         if (usec > 1'000'000) {
             ts->seconds++;
             usec -= 1'000'000;
@@ -260,7 +261,6 @@ static void stamp(ntp_timestamp *ts) {
         ts->fraction = uint32_t(double(usec) * (1LL << 32) / 1'000'000);
         ts->seconds = htonl(ts->seconds);
         ts->fraction = htonl(ts->fraction);
-        xSemaphoreGive(pps_mutex);
     } else assert(false);
 }
 
@@ -285,17 +285,23 @@ static void ntp_handle(ntp_packet &packet) {
 extern "C" {
 
 void app_main(void) {
-    esp_log_write(ESP_LOG_INFO, LOG_TAG, "BOOT");
+    esp_log_write(ESP_LOG_INFO, LOG_TAG, "BOOT\n");
     pps_mutex = xSemaphoreCreateMutex();
     setup_w5500();
-    esp_log_write(ESP_LOG_INFO, LOG_TAG, "Finished w5500 setup");
+    esp_log_write(ESP_LOG_INFO, LOG_TAG, "Finished w5500 setup\n");
     setup_pps();
-    while (gps_time_in_seconds == 0)
-        sleep(1);
+    if (gps_time_in_seconds == 0)
+        esp_log_write(ESP_LOG_INFO, LOG_TAG, "PPS is ticking\n");
+    else {
+        do {
+            esp_log_write(ESP_LOG_INFO, LOG_TAG, "Waiting for GPS fix\n");
+            sleep(1);
+        } while (gps_time_in_seconds == 0);
+    }
 
-    esp_log_write(ESP_LOG_INFO, LOG_TAG, "Finished PPS setup");
+    esp_log_write(ESP_LOG_INFO, LOG_TAG, "Finished PPS setup\n");
     setup_gps();
-    esp_log_write(ESP_LOG_INFO, LOG_TAG, "Finished GPS setup");
+    esp_log_write(ESP_LOG_INFO, LOG_TAG, "Finished GPS setup\n");
     stamp(&time_at_boot);
     sockaddr_in saddr;
     memset(&saddr, 0, sizeof(saddr));
@@ -304,38 +310,30 @@ void app_main(void) {
     saddr.sin_port = htons(123);
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0) {
-        ESP_LOGE(LOG_TAG, "Can't create socket: %s", strerror(errno));
+        ESP_LOGE(LOG_TAG, "Can't create socket: %s\n", strerror(errno));
         return;
     }
     int err = bind(sockfd, (struct sockaddr *)&saddr, sizeof(saddr));
     if (err < 0) {
-        ESP_LOGE(LOG_TAG, "Can't bind socket: %s", strerror(errno));
+        ESP_LOGE(LOG_TAG, "Can't bind socket: %s\n", strerror(errno));
         return;
     }
 
     uint8_t packet[128];
-    esp_log_write(ESP_LOG_INFO, LOG_TAG, "Starting main loop");
-    while(true) {
-        sockaddr_in from;
+    esp_log_write(ESP_LOG_INFO, LOG_TAG, "Starting main loop\n");
+    sockaddr_in from;
+    while (true) {
         memset(&from, 0, sizeof(from));
         socklen_t fromlen = sizeof(from);
         auto len = recvfrom(sockfd, packet, sizeof(packet), 0, (sockaddr *)&from, &fromlen);
         if (len >= sizeof(ntp_packet)) {
-            esp_log_write(ESP_LOG_DEBUG, LOG_TAG, "Got packet");
+            esp_log_write(ESP_LOG_INFO, LOG_TAG, "Got packet %lu\n", gps_time_in_seconds);
             ntp_handle(*(ntp_packet *)packet);
-            /*
-            for (size_t i = 0; i < sizeof(ntp_packet); i += 8) {
-                const uint8_t *p = (const uint8_t *)&packet;
-                printf("%d: %02x %02x %02x %02x %02x %02x %02x %02x\n",
-                  i, p[i + 0], p[i + 1], p[i + 2], p[i + 3],
-                     p[i + 4], p[i + 5], p[i + 6], p[i + 7]);
-            }
-             */
             auto sent = sendto(sockfd, packet, sizeof(ntp_packet), 0, (const sockaddr *)&from, fromlen);
             if (sent == -1) {
-                ESP_LOGE(LOG_TAG, "Error sending reply: %s", strerror(errno));
+                ESP_LOGE(LOG_TAG, "Error sending reply: %s\n", strerror(errno));
             }
-            esp_log_write(ESP_LOG_DEBUG, LOG_TAG, "Sent reply");
+            esp_log_write(ESP_LOG_INFO, LOG_TAG, "Sent reply\n");
         }
     }
 }
