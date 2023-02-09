@@ -22,7 +22,7 @@
 
 using namespace std::literals;
 
-constexpr std::string_view hostname { "esp-ntpd" };
+constexpr std::string_view hostname { "esp-ntp" };
 constexpr gpio_num_t UART_GPIO_TX = gpio_num_t::GPIO_NUM_2;//0;
 constexpr gpio_num_t UART_GPIO_RX = gpio_num_t::GPIO_NUM_3;
 constexpr gpio_num_t GPIO_PPS = gpio_num_t::GPIO_NUM_1;
@@ -43,10 +43,12 @@ static uint64_t us_since_boot_of_last_pps;
 
 static void pps_handler(void *) {
     xSemaphoreTakeFromISR(pps_mutex, nullptr);
-    ++gps_time_in_seconds;
-    us_since_boot_of_last_pps = esp_timer_get_time();
+    auto us_since_boot_now = esp_timer_get_time();
+    if (gps_time_in_seconds != 0 && us_since_boot_now - us_since_boot_of_last_pps < 1'100'000) {
+        ++gps_time_in_seconds;
+        us_since_boot_of_last_pps = us_since_boot_now;
+    } else gps_time_in_seconds = 0;
     xSemaphoreGiveFromISR(pps_mutex, nullptr);
-    ets_printf("PPS %lu\n", gps_time_in_seconds);
 }
 
 static void setup_pps() {
@@ -80,7 +82,7 @@ static void setup_gps() {
 
     char buf[NMEA_MAX_SENTENCE_LENGTH + 1];
     buf[NMEA_MAX_SENTENCE_LENGTH] = 0;
-    esp_log_write(ESP_LOG_INFO, LOG_TAG, "Waiting for GPS fix");
+    esp_log_write(ESP_LOG_INFO, LOG_TAG, "Waiting for GPS fix\n");
     while (true) {
         auto num_read = uart_read_bytes(UART_NUM_1, buf, NMEA_MAX_SENTENCE_LENGTH, 20 /  portTICK_PERIOD_MS);
         if (num_read == -1) {
@@ -96,7 +98,6 @@ static void setup_gps() {
         for (auto line: std::string_view(buf, buf + num_read)
                 | std::ranges::views::split('\n')
                 | std::ranges::views::transform([](auto&& str) { return std::string_view(&*str.begin(), std::ranges::distance(str)); })) {
-            esp_log_write(ESP_LOG_DEBUG, LOG_TAG, "%s\n", line.data());
 
             if (line.starts_with("$GPRMC")) {
                 struct tm tm;
@@ -139,11 +140,13 @@ static void setup_gps() {
 
                 if (okay) {
                     auto unix_timestamp = mktime(&tm);
+                    esp_log_write(ESP_LOG_INFO, LOG_TAG, "Got unix timestamp of %llu\n", unix_timestamp);
                     if (xSemaphoreTake(pps_mutex, 10) == pdTRUE) {
                         gps_time_in_seconds = (uint32_t)unix_timestamp + 25567U * 24 * 3600; // there were, according to some googling, 22567 days between 1/1/1900 and 1/1/1970.
+                        us_since_boot_of_last_pps = esp_timer_get_time();
                         xSemaphoreGive(pps_mutex);
                     }
-                    esp_log_write(ESP_LOG_DEBUG, LOG_TAG, "Got GPS timestamp of %lu", gps_time_in_seconds);
+                    esp_log_write(ESP_LOG_INFO, LOG_TAG, "Got GPS timestamp of %lu\n", gps_time_in_seconds);
 
                     ESP_ERROR_CHECK(uart_driver_delete(UART_NUM_1));
                     return;
@@ -247,25 +250,39 @@ struct ntp_packet {
 
 static ntp_timestamp time_at_boot;
 
-static void stamp(ntp_timestamp *ts) {
+static bool stamp(ntp_timestamp *ts) {
     if (xSemaphoreTake(pps_mutex, 10) == pdTRUE) {
         ts->seconds = gps_time_in_seconds;
         auto usec = us_since_boot_of_last_pps;
         xSemaphoreGive(pps_mutex);
+        if (ts->seconds == 0)
+            return false;
         usec = esp_timer_get_time() - usec;
         if (usec > 1'000'000) {
             ts->seconds++;
             usec -= 1'000'000;
         }
-        assert(usec < 1'000'000); // else we're more than one whole seconds off from the last PPS, which is extremely wrong
+        if (usec > 1'000'000) {
+            if (xSemaphoreTake(pps_mutex, 10) == pdTRUE) {
+                gps_time_in_seconds = 0;
+                xSemaphoreGive(pps_mutex);
+                return false;
+            }
+        }
         ts->fraction = uint32_t(double(usec) * (1LL << 32) / 1'000'000);
         ts->seconds = htonl(ts->seconds);
         ts->fraction = htonl(ts->fraction);
+        return true;
     } else assert(false);
 }
 
 static void ntp_handle(ntp_packet &packet) {
-    stamp(&packet.receive);
+    if (!stamp(&packet.receive)) {
+        // it's been too long since the last PPS. resync to GPS.
+        ESP_LOGW(LOG_TAG, "Lost PPS signal\n");
+        setup_gps();
+        ESP_LOGI(LOG_TAG, "Got GPS signal\n");
+    }
 
     packet.origin = packet.transmit;
     packet.li_vn_mode = 0b00011100;
@@ -313,8 +330,17 @@ void app_main(void) {
         ESP_LOGE(LOG_TAG, "Can't create socket: %s\n", strerror(errno));
         return;
     }
-    int err = bind(sockfd, (struct sockaddr *)&saddr, sizeof(saddr));
-    if (err < 0) {
+
+    struct timeval timeout;
+    timeout.tv_sec = 1;
+    timeout.tv_usec = 0;
+    int status = setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    if (status < 0) {
+        ESP_LOGE(LOG_TAG, "Can't set timeout on socket: %s\n", strerror(errno));
+        return;
+    }
+    status = bind(sockfd, (struct sockaddr *)&saddr, sizeof(saddr));
+    if (status < 0) {
         ESP_LOGE(LOG_TAG, "Can't bind socket: %s\n", strerror(errno));
         return;
     }
@@ -326,14 +352,19 @@ void app_main(void) {
         memset(&from, 0, sizeof(from));
         socklen_t fromlen = sizeof(from);
         auto len = recvfrom(sockfd, packet, sizeof(packet), 0, (sockaddr *)&from, &fromlen);
-        if (len >= sizeof(ntp_packet)) {
-            esp_log_write(ESP_LOG_INFO, LOG_TAG, "Got packet %lu\n", gps_time_in_seconds);
+        if (len < 1) {
+            // normally we'd get EGAIN or EWOULDBLOCK but apparently not with
+            // lwip. assume this is a timeout and call the ntp handler so it
+            // checks that we have a good signal and tries to resync if we
+            // don't.
+            ntp_handle(*(ntp_packet *)packet);
+        } else if (len >= sizeof(ntp_packet)) {
             ntp_handle(*(ntp_packet *)packet);
             auto sent = sendto(sockfd, packet, sizeof(ntp_packet), 0, (const sockaddr *)&from, fromlen);
             if (sent == -1) {
                 ESP_LOGE(LOG_TAG, "Error sending reply: %s\n", strerror(errno));
             }
-            esp_log_write(ESP_LOG_INFO, LOG_TAG, "Sent reply\n");
+            esp_log_write(ESP_LOG_INFO, LOG_TAG, "Replied to %s\n", inet_ntoa(from.sin_addr));
         }
     }
 }
