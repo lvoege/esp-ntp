@@ -37,18 +37,17 @@ const int NMEA_MAX_SENTENCE_LENGTH = 79;
 
 const char LOG_TAG[] = "esp-ntp";
 
-static SemaphoreHandle_t pps_mutex;
 static uint32_t gps_time_in_seconds = 0;
 static uint64_t us_since_boot_of_last_pps;
 
 static void pps_handler(void *) {
-    xSemaphoreTakeFromISR(pps_mutex, nullptr);
+    vPortEnterCritical();
     auto us_since_boot_now = esp_timer_get_time();
     if (gps_time_in_seconds != 0 && us_since_boot_now - us_since_boot_of_last_pps < 1'100'000) {
         ++gps_time_in_seconds;
         us_since_boot_of_last_pps = us_since_boot_now;
     } else gps_time_in_seconds = 0;
-    xSemaphoreGiveFromISR(pps_mutex, nullptr);
+    vPortExitCritical();
 }
 
 static void setup_pps() {
@@ -141,11 +140,11 @@ static void setup_gps() {
                 if (okay) {
                     auto unix_timestamp = mktime(&tm);
                     esp_log_write(ESP_LOG_INFO, LOG_TAG, "Got unix timestamp of %llu\n", unix_timestamp);
-                    if (xSemaphoreTake(pps_mutex, 10) == pdTRUE) {
-                        gps_time_in_seconds = (uint32_t)unix_timestamp + 25567U * 24 * 3600; // there were, according to some googling, 22567 days between 1/1/1900 and 1/1/1970.
-                        us_since_boot_of_last_pps = esp_timer_get_time();
-                        xSemaphoreGive(pps_mutex);
-                    }
+                    auto us_since_boot_now = esp_timer_get_time();
+                    vPortEnterCritical();
+                    gps_time_in_seconds = (uint32_t)unix_timestamp + 25567U * 24 * 3600; // there were, according to some googling, 22567 days between 1/1/1900 and 1/1/1970.
+                    us_since_boot_of_last_pps = us_since_boot_now;
+                    vPortExitCritical();
                     esp_log_write(ESP_LOG_INFO, LOG_TAG, "Got GPS timestamp of %lu\n", gps_time_in_seconds);
 
                     ESP_ERROR_CHECK(uart_driver_delete(UART_NUM_1));
@@ -251,29 +250,27 @@ struct ntp_packet {
 static ntp_timestamp time_at_boot;
 
 static bool stamp(ntp_timestamp *ts) {
-    if (xSemaphoreTake(pps_mutex, 10) == pdTRUE) {
-        ts->seconds = gps_time_in_seconds;
-        auto usec = us_since_boot_of_last_pps;
-        xSemaphoreGive(pps_mutex);
-        if (ts->seconds == 0)
-            return false;
-        usec = esp_timer_get_time() - usec;
-        if (usec > 1'000'000) {
-            ts->seconds++;
-            usec -= 1'000'000;
-        }
-        if (usec > 1'000'000) {
-            if (xSemaphoreTake(pps_mutex, 10) == pdTRUE) {
-                gps_time_in_seconds = 0;
-                xSemaphoreGive(pps_mutex);
-                return false;
-            }
-        }
-        ts->fraction = uint32_t(double(usec) * (1LL << 32) / 1'000'000);
-        ts->seconds = htonl(ts->seconds);
-        ts->fraction = htonl(ts->fraction);
-        return true;
-    } else assert(false);
+    vPortEnterCritical();
+    ts->seconds = gps_time_in_seconds;
+    auto usec = us_since_boot_of_last_pps;
+    vPortExitCritical();
+    if (ts->seconds == 0)
+        return false;
+    usec = esp_timer_get_time() - usec;
+    if (usec > 1'000'000) {
+        ts->seconds++;
+        usec -= 1'000'000;
+    }
+    if (usec > 1'000'000) {
+        vPortEnterCritical();
+        gps_time_in_seconds = 0;
+        vPortExitCritical();
+        return false;
+    }
+    ts->fraction = uint32_t(double(usec) * (1LL << 32) / 1'000'000);
+    ts->seconds = htonl(ts->seconds);
+    ts->fraction = htonl(ts->fraction);
+    return true;
 }
 
 static void ntp_handle(ntp_packet &packet) {
@@ -303,7 +300,6 @@ extern "C" {
 
 void app_main(void) {
     esp_log_write(ESP_LOG_INFO, LOG_TAG, "BOOT\n");
-    pps_mutex = xSemaphoreCreateMutex();
     setup_w5500();
     esp_log_write(ESP_LOG_INFO, LOG_TAG, "Finished w5500 setup\n");
     setup_pps();
