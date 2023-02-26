@@ -1,27 +1,30 @@
 // barebones stratum 1 NTPv3 server for an ESP32-C3 with a W5500-lite ethernet adapter and a ublox neo-6 GPS unit with PPS.
-#include <atomic>
-#include <ctype.h>
-#include <cstring>
-#include <driver/uart.h>
-#include <esp_log.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
-#include <esp_event.h>
 #include <algorithm>
+#include <cctype>
+#include <cstring>
+#include <ctime>
+#include <random>
 #include <ranges>
 #include <string_view>
-#include <esp_eth.h>
+
 #include <esp_eth_netif_glue.h>
+#include <esp_event.h>
+#include <esp_log.h>
 #include <esp_netif.h>
-#include <driver/gpio.h>
-#include <random>
-#include <lwip/sockets.h>
-#include <time.h>
-#include <rom/ets_sys.h>
 #include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <lwip/sockets.h>
+#include <driver/gpio.h>
+#include <driver/uart.h>
+#include <driver/ledc.h>
+#include <rom/ets_sys.h>
+#include <esp_wifi.h>
 
 using namespace std::literals;
 
+constexpr int NMEA_MAX_SENTENCE_LENGTH = 79;
+
+#if FIRST_PROTOTYPE
 constexpr std::string_view hostname { "esp-ntp" };
 constexpr gpio_num_t UART_GPIO_TX = gpio_num_t::GPIO_NUM_2;//0;
 constexpr gpio_num_t UART_GPIO_RX = gpio_num_t::GPIO_NUM_3;
@@ -32,8 +35,18 @@ constexpr gpio_num_t SPI_GPIO_SCLK = gpio_num_t::GPIO_NUM_8;
 constexpr gpio_num_t PHY_GPIO_RST = gpio_num_t::GPIO_NUM_NC; // not hooked
 constexpr gpio_num_t SPI_GPIO_CS = gpio_num_t::GPIO_NUM_7;
 constexpr gpio_num_t W5500_GPIO_INT = gpio_num_t::GPIO_NUM_6;
-
-const int NMEA_MAX_SENTENCE_LENGTH = 79;
+#else
+constexpr std::string_view hostname { "esp-ntp2" };
+constexpr gpio_num_t UART_GPIO_TX = gpio_num_t::GPIO_NUM_9;//0;
+constexpr gpio_num_t UART_GPIO_RX = gpio_num_t::GPIO_NUM_5;
+constexpr gpio_num_t GPIO_PPS = gpio_num_t::GPIO_NUM_7;
+constexpr gpio_num_t SPI_GPIO_MISO = gpio_num_t::GPIO_NUM_6;
+constexpr gpio_num_t SPI_GPIO_MOSI = gpio_num_t::GPIO_NUM_2;
+constexpr gpio_num_t SPI_GPIO_SCLK = gpio_num_t::GPIO_NUM_3;
+constexpr gpio_num_t PHY_GPIO_RST = gpio_num_t::GPIO_NUM_NC; // not hooked
+constexpr gpio_num_t SPI_GPIO_CS = gpio_num_t::GPIO_NUM_0;
+constexpr gpio_num_t W5500_GPIO_INT = gpio_num_t::GPIO_NUM_1;
+#endif
 
 const char LOG_TAG[] = "esp-ntp";
 
@@ -182,7 +195,6 @@ static void got_ip_event_handler(void *arg, esp_event_base_t event_base, int32_t
 }
 
 static void setup_w5500() {
-    ESP_ERROR_CHECK(gpio_install_isr_service(0));
     spi_bus_config_t spi_bus_config;
     memset(&spi_bus_config, 0, sizeof(spi_bus_config));
     spi_bus_config.miso_io_num = SPI_GPIO_MISO;
@@ -209,7 +221,7 @@ static void setup_w5500() {
     ESP_ERROR_CHECK(esp_eth_driver_install(&eth_config_spi, &eth_handle));
 
 #if 1
-    uint8_t mac_addr[6] = { 0xba, 0x34, 0x88, 0xc9, 0x48, 0x69 };
+    uint8_t mac_addr[6] = { 0xba, 0x34, 0x88, 0xc9, 0x48, 0x6a };
     ESP_ERROR_CHECK(esp_eth_ioctl(eth_handle, ETH_CMD_S_MAC_ADDR, mac_addr));
 #else
     {
@@ -313,6 +325,8 @@ extern "C" {
 
 void app_main(void) {
     esp_log_write(ESP_LOG_INFO, LOG_TAG, "BOOT\n");
+    esp_wifi_stop();
+    ESP_ERROR_CHECK(gpio_install_isr_service(0));
     setup_w5500();
     esp_log_write(ESP_LOG_INFO, LOG_TAG, "Finished w5500 setup\n");
     setup_pps();
@@ -361,14 +375,8 @@ void app_main(void) {
         memset(&from, 0, sizeof(from));
         socklen_t fromlen = sizeof(from);
         auto len = recvfrom(sockfd, packet, sizeof(packet), 0, (sockaddr *)&from, &fromlen);
-        if (len < 1) {
-            // normally we'd get EGAIN or EWOULDBLOCK but apparently not with
-            // lwip. assume this is a timeout and call the ntp handler so it
-            // checks that we have a good signal and tries to resync if we
-            // don't.
-            ntp_handle(*(ntp_packet *)packet);
-        } else if (len >= sizeof(ntp_packet)) {
-            ntp_handle(*(ntp_packet *)packet);
+        ntp_handle(*(ntp_packet *)packet);
+        if (len >= (ssize_t)sizeof(ntp_packet)) {
             auto sent = sendto(sockfd, packet, sizeof(ntp_packet), 0, (const sockaddr *)&from, fromlen);
             if (sent == -1) {
                 ESP_LOGE(LOG_TAG, "Error sending reply: %s\n", strerror(errno));
