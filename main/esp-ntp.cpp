@@ -67,23 +67,25 @@ static void setup_pps() {
 // then on we use the PPS signal.
 static void setup_gps() {
     uart_config_t uart_config = {
-            .baud_rate = 9600,
-            .data_bits = UART_DATA_8_BITS,
-            .parity = UART_PARITY_DISABLE,
-            .stop_bits = UART_STOP_BITS_1,
-            .flow_ctrl = UART_HW_FLOWCTRL_CTS_RTS,
-            .rx_flow_ctrl_thresh = 122,
-            .source_clk = UART_SCLK_DEFAULT,
+        .baud_rate = 9600,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_CTS_RTS,
+        .rx_flow_ctrl_thresh = 122,
+        .source_clk = UART_SCLK_DEFAULT,
     };
     ESP_ERROR_CHECK(uart_param_config(UART_NUM_1, &uart_config));
-    ESP_ERROR_CHECK(uart_driver_install(UART_NUM_1, NMEA_MAX_SENTENCE_LENGTH * 2, 0, 0, nullptr, 0));
+    ESP_ERROR_CHECK(uart_driver_install(UART_NUM_1, BUFSIZ * 2, 0, 0, nullptr, 0));
     ESP_ERROR_CHECK(uart_set_pin(UART_NUM_1, UART_GPIO_TX, UART_GPIO_RX, -1, -1));
 
-    char buf[NMEA_MAX_SENTENCE_LENGTH + 1];
-    buf[NMEA_MAX_SENTENCE_LENGTH] = 0;
+    std::string sentence_in_progress;
+    static_assert(BUFSIZ > NMEA_MAX_SENTENCE_LENGTH);
+    char buf[BUFSIZ + 1];
+    buf[BUFSIZ] = 0;
     esp_log_write(ESP_LOG_INFO, LOG_TAG, "Waiting for GPS fix\n");
     while (true) {
-        auto num_read = uart_read_bytes(UART_NUM_1, buf, NMEA_MAX_SENTENCE_LENGTH, 20 /  portTICK_PERIOD_MS);
+        auto num_read = uart_read_bytes(UART_NUM_1, buf, BUFSIZ, 20 /  portTICK_PERIOD_MS);
         if (num_read == -1) {
             ESP_LOGE("UART read", "eep");
             continue;
@@ -92,13 +94,19 @@ static void setup_gps() {
         if (num_read == 0)
             continue;
 
+        sentence_in_progress += std::string(buf, num_read);
+
         // look for a GPRMC sentence, because that has the three things we need: an
         // indicator if we have a good fix or not, a UTC timestamp and a date.
-        for (auto line: std::string_view(buf, buf + num_read)
-                | std::ranges::views::split('\n')
+        for (auto line: sentence_in_progress
+                | std::ranges::views::split('$')
                 | std::ranges::views::transform([](auto&& str) { return std::string_view(&*str.begin(), std::ranges::distance(str)); })) {
 
-            if (line.starts_with("$GPRMC")) {
+            if (line.ends_with('\n'))
+                line = line.substr(0, line.size() - 1);
+            if (line.ends_with('\r'))
+                line = line.substr(0, line.size() - 1);
+            if (line.starts_with("GPRMC") || line.starts_with("GNRMC")) {
                 struct tm tm;
                 memset(&tm, 0, sizeof(tm));
 
@@ -112,7 +120,7 @@ static void setup_gps() {
                         return word.size() >= 6 && isdigit(word[0]) && isdigit(word[1]) && isdigit(word[2]) && isdigit(word[3]) && isdigit(word[4]) && isdigit(word[5]);
                     };
                     switch (wordno++) {
-                        case 0: assert(word == "$GPRMC"); break;
+                        case 0: assert(word == "GPRMC" || word == "GNRMC"); break;
                         case 1: {
                             if (is_six_digits()) {
                                 tm.tm_hour = (word[0] - '0') * 10 + (word[1] - '0');
@@ -135,9 +143,11 @@ static void setup_gps() {
                         }
                         default: break;
                     }
+                    if (!okay)
+                        break;
                 }
 
-                if (okay) {
+                if (okay && wordno > 9) {
                     auto unix_timestamp = mktime(&tm);
                     esp_log_write(ESP_LOG_INFO, LOG_TAG, "Got unix timestamp of %llu\n", unix_timestamp);
                     auto us_since_boot_now = esp_timer_get_time();
@@ -152,6 +162,9 @@ static void setup_gps() {
                 }
             }
         }
+        auto pos = sentence_in_progress.rfind('$');
+        if (pos != std::string::npos)
+            sentence_in_progress = sentence_in_progress.substr(pos);
     }
 }
 
