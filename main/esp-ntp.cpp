@@ -35,7 +35,7 @@ constexpr gpio_num_t SPI_GPIO_SCLK = gpio_num_t::GPIO_NUM_8;
 constexpr gpio_num_t PHY_GPIO_RST = gpio_num_t::GPIO_NUM_NC; // not hooked
 constexpr gpio_num_t SPI_GPIO_CS = gpio_num_t::GPIO_NUM_7;
 constexpr gpio_num_t W5500_GPIO_INT = gpio_num_t::GPIO_NUM_6;
-#else
+#elif SECOND_PROTOTYPE
 constexpr std::string_view hostname { "esp-ntp2" };
 constexpr gpio_num_t UART_GPIO_TX = gpio_num_t::GPIO_NUM_9;//0;
 constexpr gpio_num_t UART_GPIO_RX = gpio_num_t::GPIO_NUM_5;
@@ -46,6 +46,17 @@ constexpr gpio_num_t SPI_GPIO_SCLK = gpio_num_t::GPIO_NUM_3;
 constexpr gpio_num_t PHY_GPIO_RST = gpio_num_t::GPIO_NUM_NC; // not hooked
 constexpr gpio_num_t SPI_GPIO_CS = gpio_num_t::GPIO_NUM_0;
 constexpr gpio_num_t W5500_GPIO_INT = gpio_num_t::GPIO_NUM_1;
+#else
+constexpr std::string_view hostname { "esp-ntp3" };
+constexpr gpio_num_t UART_GPIO_TX = gpio_num_t::GPIO_NUM_NC;//0;
+constexpr gpio_num_t UART_GPIO_RX = gpio_num_t::GPIO_NUM_2;
+constexpr gpio_num_t GPIO_PPS = gpio_num_t::GPIO_NUM_3;
+constexpr gpio_num_t SPI_GPIO_MISO = gpio_num_t::GPIO_NUM_7;
+constexpr gpio_num_t SPI_GPIO_MOSI = gpio_num_t::GPIO_NUM_10;
+constexpr gpio_num_t SPI_GPIO_SCLK = gpio_num_t::GPIO_NUM_1;
+constexpr gpio_num_t PHY_GPIO_RST = gpio_num_t::GPIO_NUM_NC; // not hooked
+constexpr gpio_num_t SPI_GPIO_CS = gpio_num_t::GPIO_NUM_0;
+constexpr gpio_num_t W5500_GPIO_INT = gpio_num_t::GPIO_NUM_5;
 #endif
 
 const char LOG_TAG[] = "esp-ntp";
