@@ -303,7 +303,7 @@ static bool stamp(ntp_timestamp *ts) {
         vPortExitCritical();
         return false;
     }
-    ts->fraction = uint32_t(double(usec) * (1LL << 32) / 1'000'000);
+    ts->fraction = uint32_t((uint64_t(usec) * (1LL << 32)) / 1'000'000);
     ts->seconds = htonl(ts->seconds);
     ts->fraction = htonl(ts->fraction);
     return true;
